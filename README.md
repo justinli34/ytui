@@ -1,6 +1,6 @@
 # ytui
 
-A Windows terminal UI for searching, playing, and downloading YouTube audio.
+A terminal UI for searching, playing, and downloading YouTube audio.
 
 ![Screenshot](assets/screenshot.png)
 

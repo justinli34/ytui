@@ -1,7 +1,7 @@
 [project]
 name = "ytui"
 version = "0.1.0"
-description = "A Windows terminal UI for searching, playing, and downloading YouTube audio."
+description = "A terminal UI for searching, playing, and downloading YouTube audio."
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
