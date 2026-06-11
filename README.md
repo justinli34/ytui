@@ -25,7 +25,3 @@ uv tool install . --python 3.14
 ```
 ytui
 ```
-
-## Known Issues
-
-- Closing the terminal doesn't kill the mpv process.
