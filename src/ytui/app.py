@@ -30,7 +30,7 @@ RESULTS_CONTROLS_HELP_LINES = (
     ("Ctrl+P", "show/hide controls"),
     ("Enter", "play highlighted result"),
     ("Space", "pause/resume playback"),
-    ("Ctrl+S", "download highlighted result"),
+    ("d", "download highlighted result"),
     ("Up/Down", "select result"),
     ("Shift+Up/Down", "change volume"),
     ("Left/Right", "scrub playback"),
@@ -167,7 +167,7 @@ class App:
             self._scrub_current_playback(SCRUB_SECONDS)
         elif key == " ":
             self._toggle_current_playback()
-        elif key == "\x13":
+        elif key == "d":
             self._download_selected_result()
         elif key == "/":
             self.focus = "search"
