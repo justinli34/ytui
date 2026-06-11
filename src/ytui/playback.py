@@ -1,95 +1,49 @@
-import ctypes
 import json
-import os
 import subprocess
-from ctypes import wintypes
 
-PIPE_PATH = r"\\.\pipe\mpv-control"
-GRACEFUL_QUIT_TIMEOUT_SECONDS = 1.0
-TERMINATE_TIMEOUT_SECONDS = 1.0
-
-_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS = 9
-_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
-
-
-class _JobObjectBasicLimitInformation(ctypes.Structure):
-    _fields_ = [
-        ("PerProcessUserTimeLimit", ctypes.c_longlong),
-        ("PerJobUserTimeLimit", ctypes.c_longlong),
-        ("LimitFlags", wintypes.DWORD),
-        ("MinimumWorkingSetSize", ctypes.c_size_t),
-        ("MaximumWorkingSetSize", ctypes.c_size_t),
-        ("ActiveProcessLimit", wintypes.DWORD),
-        ("Affinity", ctypes.c_size_t),
-        ("PriorityClass", wintypes.DWORD),
-        ("SchedulingClass", wintypes.DWORD),
-    ]
-
-
-class _IoCounters(ctypes.Structure):
-    _fields_ = [
-        ("ReadOperationCount", ctypes.c_ulonglong),
-        ("WriteOperationCount", ctypes.c_ulonglong),
-        ("OtherOperationCount", ctypes.c_ulonglong),
-        ("ReadTransferCount", ctypes.c_ulonglong),
-        ("WriteTransferCount", ctypes.c_ulonglong),
-        ("OtherTransferCount", ctypes.c_ulonglong),
-    ]
-
-
-class _JobObjectExtendedLimitInformation(ctypes.Structure):
-    _fields_ = [
-        ("BasicLimitInformation", _JobObjectBasicLimitInformation),
-        ("IoInfo", _IoCounters),
-        ("ProcessMemoryLimit", ctypes.c_size_t),
-        ("JobMemoryLimit", ctypes.c_size_t),
-        ("PeakProcessMemoryUsed", ctypes.c_size_t),
-        ("PeakJobMemoryUsed", ctypes.c_size_t),
-    ]
-
-
-if os.name == "nt":
-    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    _kernel32.AssignProcessToJobObject.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
-    _kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
-    _kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
-    _kernel32.CloseHandle.restype = wintypes.BOOL
-    _kernel32.CreateJobObjectW.argtypes = (wintypes.LPVOID, wintypes.LPCWSTR)
-    _kernel32.CreateJobObjectW.restype = wintypes.HANDLE
-    _kernel32.SetInformationJobObject.argtypes = (
-        wintypes.HANDLE,
-        ctypes.c_int,
-        wintypes.LPVOID,
-        wintypes.DWORD,
-    )
-    _kernel32.SetInformationJobObject.restype = wintypes.BOOL
-else:
-    _kernel32 = None
+from ytui.mpv_runtime import MPV_RUNTIME, ChildProcessLifetime, MpvIpcEndpoint, MpvProcess
 
 
 class AudioPlayer:
     def __init__(self, url: str, *, volume: int = 100) -> None:
         self.url = url
         self.volume = volume
-        self.process = None
-        self._job_handle = None
+        self.process: MpvProcess | None = None
+        self._ipc: MpvIpcEndpoint | None = None
+        self._lifetime: ChildProcessLifetime | None = None
 
     def start(self) -> None:
         self.stop()
-        self.process = subprocess.Popen(
-            [
-                "mpv",
-                "--no-video",
-                "--no-terminal",
-                f"--volume={self.volume}",
-                f"--input-ipc-server={PIPE_PATH}",
-                self.url,
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=_creation_flags(),
-        )
-        self._job_handle = _create_kill_on_close_job(self.process)
+
+        ipc = MPV_RUNTIME.create_ipc_endpoint()
+        try:
+            process = subprocess.Popen(
+                [
+                    "mpv",
+                    "--no-video",
+                    "--no-terminal",
+                    f"--volume={self.volume}",
+                    f"--input-ipc-server={ipc.path}",
+                    self.url,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=MPV_RUNTIME.creation_flags(),
+            )
+        except Exception:
+            ipc.close()
+            raise
+
+        try:
+            lifetime = MPV_RUNTIME.bind_child_process_lifetime(process)
+        except Exception:
+            _kill_process(process)
+            ipc.close()
+            raise
+
+        self.process = process
+        self._ipc = ipc
+        self._lifetime = lifetime
 
     def pause(self) -> None:
         self._command("set_property", "pause", True)
@@ -115,32 +69,39 @@ class AudioPlayer:
 
     def stop(self) -> None:
         process = self.process
+        ipc = self._ipc
+        lifetime = self._lifetime
         self.process = None
-        if process is None:
-            self._close_job_handle()
-            return
+        self._ipc = None
+        self._lifetime = None
 
         try:
-            if process.poll() is None:
+            if process is not None and process.poll() is None:
                 try:
-                    self._command("quit")
-                    process.wait(timeout=GRACEFUL_QUIT_TIMEOUT_SECONDS)
-                except FileNotFoundError, OSError, subprocess.TimeoutExpired:
-                    _terminate_process(process)
+                    if ipc is None:
+                        raise OSError("mpv IPC endpoint is not available")
+
+                    ipc.command("quit")
+                    process.wait()
+                except FileNotFoundError, OSError:
+                    _kill_process(process)
         finally:
-            self._close_job_handle()
+            if lifetime is not None:
+                lifetime.close()
+            if ipc is not None:
+                ipc.close()
 
     def is_running(self) -> bool:
-        return self._is_running()
+        if self.process is None:
+            return False
+        if self.process.poll() is None:
+            return True
+
+        self.stop()
+        return False
 
     def _is_running(self) -> bool:
         return self.process is not None and self.process.poll() is None
-
-    def _close_job_handle(self) -> None:
-        job_handle = self._job_handle
-        self._job_handle = None
-        if job_handle is not None:
-            _close_handle(job_handle)
 
     def _get_number_property(self, name: str) -> float | None:
         if not self._is_running():
@@ -166,78 +127,25 @@ class AudioPlayer:
             return None
 
     def _command(self, *args: object) -> None:
-        message = json.dumps({"command": list(args)}) + "\n"
-
-        with open(PIPE_PATH, "r+b", buffering=0) as pipe:
-            pipe.write(message.encode())
+        self._active_ipc().command(*args)
 
     def _request(self, *args: object) -> dict[str, object]:
-        message = json.dumps({"command": list(args)}) + "\n"
+        return self._active_ipc().request(*args)
 
-        with open(PIPE_PATH, "r+b", buffering=0) as pipe:
-            pipe.write(message.encode())
-            response = pipe.readline()
+    def _active_ipc(self) -> MpvIpcEndpoint:
+        if self._ipc is None:
+            raise OSError("mpv IPC endpoint is not available")
 
-        if not response:
-            return {}
-
-        return json.loads(response.decode())
+        return self._ipc
 
 
-def _creation_flags() -> int:
-    if os.name != "nt":
-        return 0
-
-    return subprocess.CREATE_NO_WINDOW
-
-
-def _create_kill_on_close_job(process: subprocess.Popen[bytes]) -> int | None:
-    if os.name != "nt" or _kernel32 is None:
-        return None
-
-    job_handle = _kernel32.CreateJobObjectW(None, None)
-    if not job_handle:
-        return None
-
-    try:
-        limit_info = _JobObjectExtendedLimitInformation()
-        limit_info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-        if not _kernel32.SetInformationJobObject(
-            job_handle,
-            _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
-            ctypes.byref(limit_info),
-            ctypes.sizeof(limit_info),
-        ):
-            raise ctypes.WinError(ctypes.get_last_error())
-
-        process_handle = getattr(process, "_handle", None)
-        if process_handle is None:
-            raise OSError("Could not access process handle")
-
-        if not _kernel32.AssignProcessToJobObject(job_handle, process_handle):
-            raise ctypes.WinError(ctypes.get_last_error())
-    except OSError:
-        _close_handle(job_handle)
-        return None
-
-    return job_handle
-
-
-def _close_handle(handle: int) -> None:
-    if os.name == "nt" and _kernel32 is not None:
-        _kernel32.CloseHandle(handle)
-
-
-def _terminate_process(process: subprocess.Popen[bytes]) -> None:
+def _kill_process(process: MpvProcess) -> None:
     if process.poll() is not None:
         return
 
     try:
-        process.terminate()
-        process.wait(timeout=TERMINATE_TIMEOUT_SECONDS)
-    except OSError, subprocess.TimeoutExpired:
-        try:
-            process.kill()
-            process.wait(timeout=TERMINATE_TIMEOUT_SECONDS)
-        except OSError, subprocess.TimeoutExpired:
-            pass
+        process.kill()
+    except OSError:
+        return
+
+    process.wait()
